@@ -31,23 +31,26 @@ export interface Params {
   minWeight: number;
   /** Max order notional as a fraction of the pool depth at the latest close. */
   maxDepthFrac: number;
+  /** Circuit breaker: no new entry after this many losing round trips. */
+  maxLosses: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
   slowSpan: 240,
   fastSpan: 60,
-  breakoutBars: 180,
-  minRangeBps: 60,
+  breakoutBars: 240,
+  minRangeBps: 100,
   volBars: 60,
   trailVolMult: 4,
-  trailMinBps: 40,
+  trailMinBps: 60,
   trailMaxBps: 120,
-  hardStopBps: 80,
-  regimeExitBps: 30,
-  cooldownBars: 60,
+  hardStopBps: 100,
+  regimeExitBps: 50,
+  cooldownBars: 240,
   volTargetBps: 12,
   minWeight: 0.3,
   maxDepthFrac: 0.02,
+  maxLosses: 2,
 };
 
 export type Decision = { kind: 'none' } | { kind: 'buy'; weight: number } | { kind: 'sell'; reason: string };
@@ -64,6 +67,9 @@ export class Strategy {
   entry = 0;
   peak = 0;
   lastExitBar = -1_000_000;
+  /** Close of the bar the exit was decided on, to score the round trip. */
+  exitClose = 0;
+  losses = 0;
   bar = -1;
 
   constructor(p: Params = DEFAULT_PARAMS) {
@@ -109,6 +115,8 @@ export class Strategy {
     } else if (!holding && this.inPos) {
       this.inPos = false;
       this.lastExitBar = this.bar;
+      // A round trip that did not clear ~30 bps of costs counts as a loss.
+      if (this.exitClose < this.entry * 1.003) this.losses++;
     }
 
     const v = this.vol();
@@ -117,15 +125,19 @@ export class Strategy {
       let trail = p.trailVolMult * v * Math.sqrt(p.volBars / 4);
       if (trail < p.trailMinBps) trail = p.trailMinBps;
       if (trail > p.trailMaxBps) trail = p.trailMaxBps;
-      if (c <= this.entry * (1 - p.hardStopBps / 10_000)) return { kind: 'sell', reason: 'hard_stop' };
-      if (c <= this.peak * (1 - trail / 10_000)) return { kind: 'sell', reason: 'trail' };
-      if (this.slow !== null && c < this.slow * (1 - p.regimeExitBps / 10_000)) return { kind: 'sell', reason: 'regime' };
-      return { kind: 'none' };
+      let reason = '';
+      if (c <= this.entry * (1 - p.hardStopBps / 10_000)) reason = 'hard_stop';
+      else if (c <= this.peak * (1 - trail / 10_000)) reason = 'trail';
+      else if (this.slow !== null && c < this.slow * (1 - p.regimeExitBps / 10_000)) reason = 'regime';
+      if (reason === '') return { kind: 'none' };
+      this.exitClose = c;
+      return { kind: 'sell', reason };
     }
 
     // Need a full lookback window before any entry.
     if (look.length < p.breakoutBars) return { kind: 'none' };
     if (this.bar - this.lastExitBar < p.cooldownBars) return { kind: 'none' };
+    if (this.losses >= p.maxLosses) return { kind: 'none' };
     let hi = -Infinity;
     let lo = Infinity;
     for (const x of look) {
