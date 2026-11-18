@@ -33,6 +33,14 @@ export interface Params {
   maxDepthFrac: number;
   /** Circuit breaker: no new entry after this many losing round trips. */
   maxLosses: number;
+  /** Multi-hour trend filter: the close must be at least trendMinBps above the close trendBars ago. */
+  trendBars: number;
+  trendMinBps: number;
+  /** Equity kill switch: once equity falls this fraction under its peak, sell and never trade again. */
+  ddStopFrac: number;
+  /** Let winners run: once the peak close is widenAfterBps over entry, the trail becomes wideTrailBps. */
+  widenAfterBps: number;
+  wideTrailBps: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
@@ -45,12 +53,18 @@ export const DEFAULT_PARAMS: Params = {
   trailMinBps: 60,
   trailMaxBps: 120,
   hardStopBps: 100,
-  regimeExitBps: 50,
-  cooldownBars: 240,
-  volTargetBps: 12,
-  minWeight: 0.3,
+  regimeExitBps: 1000,
+  cooldownBars: 120,
+  // Full size on every entry: the race rewards the right tail, not a smooth curve.
+  volTargetBps: 1e9,
+  minWeight: 1,
   maxDepthFrac: 0.02,
-  maxLosses: 2,
+  maxLosses: 4,
+  trendBars: 0,
+  trendMinBps: 0,
+  ddStopFrac: 0.1,
+  widenAfterBps: 200,
+  wideTrailBps: 300,
 };
 
 export type Decision = { kind: 'none' } | { kind: 'buy'; weight: number } | { kind: 'sell'; reason: string };
@@ -71,6 +85,11 @@ export class Strategy {
   exitClose = 0;
   losses = 0;
   bar = -1;
+  /** Long history of closes for the trend filter (trendBars + 1 kept). */
+  hist: number[] = [];
+  peakEquity = 0;
+  /** Set once the equity kill switch fires: flat for the rest of the window. */
+  halted = false;
 
   constructor(p: Params = DEFAULT_PARAMS) {
     this.p = p;
@@ -91,9 +110,13 @@ export class Strategy {
   }
 
   /** Feed one close; returns the decision for an order filled at the next open. */
-  onClose(c: number, holding: boolean): Decision {
+  onClose(c: number, holding: boolean, equity = 0): Decision {
     const p = this.p;
     this.bar++;
+    this.hist.push(c);
+    if (this.hist.length > p.trendBars + 1) this.hist.shift();
+    if (equity > this.peakEquity) this.peakEquity = equity;
+    if (!this.halted && equity > 0 && equity <= this.peakEquity * (1 - p.ddStopFrac)) this.halted = true;
     const prevClose = this.closes.length > 0 ? this.closes[this.closes.length - 1]! : null;
     if (prevClose !== null) {
       this.rets.push((c - prevClose) / prevClose);
@@ -103,7 +126,7 @@ export class Strategy {
     this.slow = this.ema(this.slow, c, p.slowSpan);
     this.fast = this.ema(this.fast, c, p.fastSpan);
     // Range of the previous breakoutBars closes (excluding this one).
-    const look = this.closes.slice(-p.breakoutBars);
+    const lookLen = Math.min(this.closes.length, p.breakoutBars);
     this.closes.push(c);
     if (this.closes.length > p.breakoutBars + 1) this.closes.shift();
 
@@ -125,8 +148,10 @@ export class Strategy {
       let trail = p.trailVolMult * v * Math.sqrt(p.volBars / 4);
       if (trail < p.trailMinBps) trail = p.trailMinBps;
       if (trail > p.trailMaxBps) trail = p.trailMaxBps;
+      if (this.peak >= this.entry * (1 + p.widenAfterBps / 10_000) && p.wideTrailBps > trail) trail = p.wideTrailBps;
       let reason = '';
-      if (c <= this.entry * (1 - p.hardStopBps / 10_000)) reason = 'hard_stop';
+      if (this.halted) reason = 'equity_dd';
+      else if (c <= this.entry * (1 - p.hardStopBps / 10_000)) reason = 'hard_stop';
       else if (c <= this.peak * (1 - trail / 10_000)) reason = 'trail';
       else if (this.slow !== null && c < this.slow * (1 - p.regimeExitBps / 10_000)) reason = 'regime';
       if (reason === '') return { kind: 'none' };
@@ -135,19 +160,27 @@ export class Strategy {
     }
 
     // Need a full lookback window before any entry.
-    if (look.length < p.breakoutBars) return { kind: 'none' };
+    if (lookLen < p.breakoutBars) return { kind: 'none' };
     if (this.bar - this.lastExitBar < p.cooldownBars) return { kind: 'none' };
-    if (this.losses >= p.maxLosses) return { kind: 'none' };
+    if (this.losses >= p.maxLosses || this.halted) return { kind: 'none' };
+    if (p.trendBars > 0) {
+      if (this.hist.length <= p.trendBars) return { kind: 'none' };
+      if (c < this.hist[0]! * (1 + p.trendMinBps / 10_000)) return { kind: 'none' };
+    }
+    const slowRising = this.prevSlow !== null && this.slow > this.prevSlow;
+    const trendUp = this.fast !== null && this.fast > this.slow && c > this.slow;
+    if (!slowRising || !trendUp) return { kind: 'none' };
+    // The previous breakoutBars closes: every kept close but this one.
     let hi = -Infinity;
     let lo = Infinity;
-    for (const x of look) {
+    const n = this.closes.length - 1;
+    for (let i = n - lookLen; i < n; i++) {
+      const x = this.closes[i]!;
       if (x > hi) hi = x;
       if (x < lo) lo = x;
     }
     const rangeBps = ((hi - lo) / lo) * 10_000;
-    const slowRising = this.prevSlow !== null && this.slow > this.prevSlow;
-    const trendUp = this.fast !== null && this.fast > this.slow && c > this.slow;
-    if (c > hi && rangeBps >= p.minRangeBps && slowRising && trendUp) {
+    if (c > hi && rangeBps >= p.minRangeBps) {
       let w = v > p.volTargetBps ? p.volTargetBps / v : 1;
       if (w < p.minWeight) w = p.minWeight;
       return { kind: 'buy', weight: w };
